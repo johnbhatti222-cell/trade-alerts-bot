@@ -66,6 +66,19 @@ SL_ATR_BUFFER = 2.2
 DEFAULT_RR = 2.0
 REACTION_LOOKBACK = 3     # candles checked for a "reaction" at a zone
 
+# --- Trade quality floor ---
+MIN_RR_RATIO = 2.0        # reject any setup whose real R:R (based on actual zone distance) falls below this
+
+# Per-instrument profit floor, based on what a 0.01 lot position actually earns -
+# more meaningful than a blanket % since it reflects your real position sizing.
+# contract_size_per_lot uses common broker defaults (BTC/USD: 1 lot = 1 BTC,
+# XAU/USD: 1 lot = 100 oz) - confirm these against your broker's contract specs.
+INSTRUMENT_PROFIT_TARGETS = {
+    "BTC/USD": {"lot_size": 0.01, "contract_size_per_lot": 1.0, "min_profit_usd": 2.0},
+    "XAU/USD": {"lot_size": 0.01, "contract_size_per_lot": 100.0, "min_profit_usd": 4.0},
+}
+MIN_REWARD_PCT = 0.3      # fallback % floor for any pair not listed above (currently: USD/JPY)
+
 RSI_PERIOD = 14
 RSI_OVERSOLD = 35
 RSI_OVERBOUGHT = 65
@@ -320,6 +333,18 @@ def volume_spike(volumes, window=VOLUME_SPIKE_WINDOW, multiplier=VOLUME_SPIKE_MU
     return volumes[-1] >= avg_vol * multiplier
 
 
+def min_reward_distance(symbol, entry_price):
+    """Returns (min_price_distance, target_profit_usd_or_None) for the reward floor.
+    Uses the instrument's configured lot/contract size if available, otherwise
+    falls back to a flat % of entry price."""
+    cfg = INSTRUMENT_PROFIT_TARGETS.get(symbol)
+    if cfg:
+        units = cfg["lot_size"] * cfg["contract_size_per_lot"]
+        if units > 0:
+            return cfg["min_profit_usd"] / units, cfg["min_profit_usd"]
+    return entry_price * (MIN_REWARD_PCT / 100), None
+
+
 # ---------- Multi-timeframe confluence ----------
 def get_htf_bias(htf_data):
     """Computes the higher-timeframe trend and nearest zones, used to gate/confirm lower-TF signals."""
@@ -553,21 +578,34 @@ def analyze_pair(symbol: str, timeframe: str, data: dict, state: dict, trade_log
                     score += 1
                     tags.append("Volume spike")
                 if score >= MIN_OPTIONAL_CONFLUENCE:
-                    key = f"{symbol}_{timeframe}_LONG"
-                    if already_alerted_recently(state, key, timeframe):
-                        print(f"[Deduped] {symbol} {timeframe} LONG - already alerted within cooldown")
+                    entry = price_now
+                    structural_low = min(lows[-REACTION_LOOKBACK:])
+                    anchor = min(zone, structural_low)
+                    sl = anchor - (current_atr * SL_ATR_BUFFER)
+                    risk = entry - sl
+                    tp = resistances_above[0] if resistances_above else entry + risk * DEFAULT_RR
+                    rr = round((tp - entry) / risk, 2) if risk > 0 else 0
+                    reward_abs = tp - entry
+                    min_dist, target_profit = min_reward_distance(symbol, entry)
+                    if rr < MIN_RR_RATIO:
+                        print(f"[Filtered] {symbol} {timeframe} LONG: R:R {rr} below minimum {MIN_RR_RATIO}")
+                    elif reward_abs < min_dist:
+                        note = f"(~${target_profit} target on 0.01 lot)" if target_profit else f"({MIN_REWARD_PCT}% floor)"
+                        print(f"[Filtered] {symbol} {timeframe} LONG: reward {reward_abs:.5f} below required {min_dist:.5f} {note}")
                     else:
-                        entry = price_now
-                        structural_low = min(lows[-REACTION_LOOKBACK:])
-                        anchor = min(zone, structural_low)
-                        sl = anchor - (current_atr * SL_ATR_BUFFER)
-                        risk = entry - sl
-                        tp = resistances_above[0] if resistances_above else entry + risk * DEFAULT_RR
-                        rr = round((tp - entry) / risk, 2) if risk > 0 else 0
-                        alert_signal(symbol, timeframe, "LONG", entry, sl, tp, rr, tags)
-                        mark_alerted(state, key)
-                        log_trade(trade_log, symbol, timeframe, "LONG", entry, sl, tp, times[-1])
-                        signal_fired = True
+                        key = f"{symbol}_{timeframe}_LONG"
+                        if already_alerted_recently(state, key, timeframe):
+                            print(f"[Deduped] {symbol} {timeframe} LONG - already alerted within cooldown")
+                        else:
+                            profit_note = None
+                            cfg = INSTRUMENT_PROFIT_TARGETS.get(symbol)
+                            if cfg:
+                                units = cfg["lot_size"] * cfg["contract_size_per_lot"]
+                                profit_note = reward_abs * units
+                            alert_signal(symbol, timeframe, "LONG", entry, sl, tp, rr, tags, profit_note)
+                            mark_alerted(state, key)
+                            log_trade(trade_log, symbol, timeframe, "LONG", entry, sl, tp, times[-1])
+                            signal_fired = True
 
     # --- SHORT setup ---
     if resistances_above and trend != "up":
@@ -597,21 +635,34 @@ def analyze_pair(symbol: str, timeframe: str, data: dict, state: dict, trade_log
                     score += 1
                     tags.append("Volume spike")
                 if score >= MIN_OPTIONAL_CONFLUENCE:
-                    key = f"{symbol}_{timeframe}_SHORT"
-                    if already_alerted_recently(state, key, timeframe):
-                        print(f"[Deduped] {symbol} {timeframe} SHORT - already alerted within cooldown")
+                    entry = price_now
+                    structural_high = max(highs[-REACTION_LOOKBACK:])
+                    anchor = max(zone, structural_high)
+                    sl = anchor + (current_atr * SL_ATR_BUFFER)
+                    risk = sl - entry
+                    tp = supports_below[0] if supports_below else entry - risk * DEFAULT_RR
+                    rr = round((entry - tp) / risk, 2) if risk > 0 else 0
+                    reward_abs = entry - tp
+                    min_dist, target_profit = min_reward_distance(symbol, entry)
+                    if rr < MIN_RR_RATIO:
+                        print(f"[Filtered] {symbol} {timeframe} SHORT: R:R {rr} below minimum {MIN_RR_RATIO}")
+                    elif reward_abs < min_dist:
+                        note = f"(~${target_profit} target on 0.01 lot)" if target_profit else f"({MIN_REWARD_PCT}% floor)"
+                        print(f"[Filtered] {symbol} {timeframe} SHORT: reward {reward_abs:.5f} below required {min_dist:.5f} {note}")
                     else:
-                        entry = price_now
-                        structural_high = max(highs[-REACTION_LOOKBACK:])
-                        anchor = max(zone, structural_high)
-                        sl = anchor + (current_atr * SL_ATR_BUFFER)
-                        risk = sl - entry
-                        tp = supports_below[0] if supports_below else entry - risk * DEFAULT_RR
-                        rr = round((entry - tp) / risk, 2) if risk > 0 else 0
-                        alert_signal(symbol, timeframe, "SHORT", entry, sl, tp, rr, tags)
-                        mark_alerted(state, key)
-                        log_trade(trade_log, symbol, timeframe, "SHORT", entry, sl, tp, times[-1])
-                        signal_fired = True
+                        key = f"{symbol}_{timeframe}_SHORT"
+                        if already_alerted_recently(state, key, timeframe):
+                            print(f"[Deduped] {symbol} {timeframe} SHORT - already alerted within cooldown")
+                        else:
+                            profit_note = None
+                            cfg = INSTRUMENT_PROFIT_TARGETS.get(symbol)
+                            if cfg:
+                                units = cfg["lot_size"] * cfg["contract_size_per_lot"]
+                                profit_note = reward_abs * units
+                            alert_signal(symbol, timeframe, "SHORT", entry, sl, tp, rr, tags, profit_note)
+                            mark_alerted(state, key)
+                            log_trade(trade_log, symbol, timeframe, "SHORT", entry, sl, tp, times[-1])
+                            signal_fired = True
 
     if not signal_fired:
         near_support = f"{supports_below[0]:.5f}" if supports_below else "none"
@@ -625,15 +676,16 @@ def analyze_pair(symbol: str, timeframe: str, data: dict, state: dict, trade_log
         )
 
 
-def alert_signal(symbol, timeframe, direction, entry, sl, tp, rr, tags):
+def alert_signal(symbol, timeframe, direction, entry, sl, tp, rr, tags, profit_note=None):
     emoji = "🎯"
     tag_str = "\n".join(f"  • {t}" for t in tags)
+    profit_line = f"\nEst. profit (0.01 lot): ${profit_note:.2f}" if profit_note is not None else ""
     msg = (
         f"{emoji} *{symbol} - {direction}* ({timeframe})\n\n"
         f"Entry: `{entry:.5f}`\n"
         f"SL: `{sl:.5f}`\n"
         f"TP: `{tp:.5f}`\n"
-        f"R:R  ~1:{rr}\n\n"
+        f"R:R  ~1:{rr}{profit_line}\n\n"
         f"Confluences:\n{tag_str}\n\n"
         f"_Verify before entering. Not financial advice._"
     )
