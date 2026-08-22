@@ -120,16 +120,17 @@ BLACKOUT_AFTER_MIN = 60
 MANUAL_BLACKOUT_EVENTS = []
 
 # --- Liquidity chase detection (crypto only - BTC/USD) ---
-# Free proxy for what Coinglass's liquidation heatmap shows, built from Binance's
-# public futures data (no API key needed). Detects when one side (longs or shorts)
-# is crowded/over-leveraged and therefore at risk of a liquidity-hunt move against it.
-BINANCE_FAPI_BASE = "https://fapi.binance.com"
-CRYPTO_BINANCE_SYMBOL = {"BTC/USD": "BTCUSDT"}
-FUNDING_EXTREME_THRESHOLD = 0.0005   # 0.05% per 8h funding interval - considered "crowded"
-OI_CHANGE_LOOKBACK = 6                # hourly periods checked for open interest trend
-OI_RISING_PCT = 3.0                   # % OI increase considered "building" a crowd
-TOP_RATIO_HIGH = 1.5                  # top-trader long:short ratio above this = crowded long
-TOP_RATIO_LOW = 0.67                  # below this = crowded short
+# Free proxy for what Coinglass's liquidation heatmap shows. Uses Kraken Futures'
+# public API (no key needed) rather than Binance - Binance geo-blocks requests from
+# US IPs (HTTP 451), which is exactly where GitHub Actions' free runners are hosted.
+# Kraken is a US-licensed exchange built to serve US traffic, so it isn't blocked.
+KRAKEN_FUTURES_BASE = "https://futures.kraken.com/derivatives/api/v3"
+# Tries each symbol in order until one is found on Kraken's ticker list.
+CRYPTO_KRAKEN_SYMBOL = {"BTC/USD": ["PF_XBTUSD", "PI_XBTUSD"]}
+FUNDING_EXTREME_THRESHOLD = 0.0005   # per-interval funding rate considered "crowded"
+OI_HISTORY_MAX_ENTRIES = 40          # how many past OI readings to retain in state.json
+OI_TREND_LOOKBACK_HOURS = 6          # window used to judge whether OI is "building"
+OI_RISING_PCT = 3.0                  # % OI increase over that window considered "building" a crowd
 # =================================
 
 NY_TZ = ZoneInfo("America/New_York")
@@ -357,64 +358,83 @@ def min_reward_distance(symbol, entry_price):
     return entry_price * (MIN_REWARD_PCT / 100), None
 
 
-# ---------- Liquidity chase detection (Binance, crypto only) ----------
-def fetch_binance_json(url, params=None):
+# ---------- Liquidity chase detection (Kraken Futures, crypto only) ----------
+def fetch_public_json(url, params=None):
     try:
         r = requests.get(url, params=params, timeout=15)
         if r.status_code != 200:
-            print(f"[Binance error] {url}: {r.status_code} {r.text[:200]}")
+            print(f"[Kraken error] {url}: {r.status_code} {r.text[:200]}")
             return None
         return r.json()
     except Exception as e:
-        print(f"[Binance error] {url}: {e}")
+        print(f"[Kraken error] {url}: {e}")
         return None
 
 
-def fetch_liquidity_chase_bias(pair):
-    """Free proxy for Coinglass-style liquidation-heatmap insight, using Binance's
-    public futures data. Returns a dict with a 'bias' of:
+def update_oi_history(state, symbol, oi_value, max_entries=OI_HISTORY_MAX_ENTRIES):
+    key = f"oi_history_{symbol.replace('/', '')}"
+    hist = state.get(key, [])
+    hist.append([datetime.now(timezone.utc).isoformat(), oi_value])
+    hist = hist[-max_entries:]
+    state[key] = hist
+    return hist
+
+
+def oi_change_pct_from_history(hist, lookback_hours=OI_TREND_LOOKBACK_HOURS):
+    if len(hist) < 2:
+        return None
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    windowed = [h for h in hist if datetime.fromisoformat(h[0]) >= cutoff]
+    if len(windowed) < 2:
+        return None
+    oi_start, oi_end = windowed[0][1], windowed[-1][1]
+    if oi_start <= 0:
+        return None
+    return (oi_end - oi_start) / oi_start * 100
+
+
+def fetch_liquidity_chase_bias(pair, state):
+    """Free proxy for Coinglass-style liquidation-heatmap insight, using Kraken
+    Futures' public data (Binance is geo-blocked from GitHub Actions' US runners).
+    Returns a dict with a 'bias' of:
       'downside_hunt_risk' -> longs are crowded, price likely to get pulled down to hunt them (favors SHORT)
       'upside_hunt_risk'   -> shorts are crowded, price likely to get pulled up to hunt them (favors LONG)
-      'neutral'            -> no clear crowding
+      'neutral'            -> no clear crowding, or not enough OI history built up yet
     or None if the pair isn't a supported crypto symbol or the data couldn't be fetched.
+
+    Open interest trend is self-tracked across runs (stored in state.json) since
+    Kraken's public API doesn't expose historical OI the way Binance's did - so this
+    reads 'neutral' more often in the first few hours after deployment, by design,
+    until enough history accumulates to judge a real trend.
     """
-    symbol = CRYPTO_BINANCE_SYMBOL.get(pair)
-    if not symbol:
+    symbol_candidates = CRYPTO_KRAKEN_SYMBOL.get(pair)
+    if not symbol_candidates:
         return None
 
-    funding_data = fetch_binance_json(f"{BINANCE_FAPI_BASE}/fapi/v1/premiumIndex", {"symbol": symbol})
-    if funding_data is None:
+    data = fetch_public_json(f"{KRAKEN_FUTURES_BASE}/tickers")
+    if data is None or "tickers" not in data:
         return None
+
+    ticker = None
+    for candidate in symbol_candidates:
+        ticker = next((t for t in data["tickers"] if t.get("symbol", "").upper() == candidate), None)
+        if ticker:
+            break
+    if ticker is None:
+        print(f"[Kraken] No ticker found for {pair} among {symbol_candidates}")
+        return None
+
     try:
-        funding_rate = float(funding_data.get("lastFundingRate", 0))
+        funding_rate = float(ticker.get("fundingRate", 0) or 0)
     except (TypeError, ValueError):
         funding_rate = 0.0
+    try:
+        oi_value = float(ticker.get("openInterest", 0) or 0)
+    except (TypeError, ValueError):
+        oi_value = 0.0
 
-    oi_hist = fetch_binance_json(
-        f"{BINANCE_FAPI_BASE}/futures/data/openInterestHist",
-        {"symbol": symbol, "period": "1h", "limit": OI_CHANGE_LOOKBACK},
-    )
-    oi_change_pct = 0.0
-    if oi_hist and len(oi_hist) >= 2:
-        try:
-            oi_sorted = sorted(oi_hist, key=lambda x: x["timestamp"])
-            oi_start = float(oi_sorted[0]["sumOpenInterest"])
-            oi_end = float(oi_sorted[-1]["sumOpenInterest"])
-            if oi_start > 0:
-                oi_change_pct = (oi_end - oi_start) / oi_start * 100
-        except (KeyError, ValueError, TypeError, IndexError):
-            oi_change_pct = 0.0
-
-    ratio_data = fetch_binance_json(
-        f"{BINANCE_FAPI_BASE}/futures/data/topLongShortAccountRatio",
-        {"symbol": symbol, "period": "1h", "limit": 1},
-    )
-    top_ratio = None
-    if ratio_data:
-        try:
-            top_ratio = float(ratio_data[-1]["longShortRatio"])
-        except (KeyError, ValueError, TypeError, IndexError):
-            top_ratio = None
+    hist = update_oi_history(state, pair, oi_value)
+    oi_change_pct = oi_change_pct_from_history(hist)
 
     bearish_votes = 0  # crowded longs -> downside hunt risk -> favors SHORT
     bullish_votes = 0  # crowded shorts -> upside hunt risk -> favors LONG
@@ -424,16 +444,10 @@ def fetch_liquidity_chase_bias(pair):
     elif funding_rate <= -FUNDING_EXTREME_THRESHOLD:
         bullish_votes += 1
 
-    if oi_change_pct >= OI_RISING_PCT:
+    if oi_change_pct is not None and oi_change_pct >= OI_RISING_PCT:
         if funding_rate > 0:
             bearish_votes += 1
         elif funding_rate < 0:
-            bullish_votes += 1
-
-    if top_ratio is not None:
-        if top_ratio >= TOP_RATIO_HIGH:
-            bearish_votes += 1
-        elif top_ratio <= TOP_RATIO_LOW:
             bullish_votes += 1
 
     bias = "neutral"
@@ -446,8 +460,8 @@ def fetch_liquidity_chase_bias(pair):
         "bias": bias,
         "funding_rate": funding_rate,
         "oi_change_pct": oi_change_pct,
-        "top_ratio": top_ratio,
     }
+
 
 
 # ---------- Multi-timeframe confluence ----------
@@ -817,9 +831,9 @@ def run_once():
         pair_tfs = PAIR_TIMEFRAMES.get(pair, TIMEFRAMES)
 
         liquidity_bias = None
-        if pair in CRYPTO_BINANCE_SYMBOL:
+        if pair in CRYPTO_KRAKEN_SYMBOL:
             try:
-                liquidity_bias = fetch_liquidity_chase_bias(pair)
+                liquidity_bias = fetch_liquidity_chase_bias(pair, state)
             except Exception as e:
                 print(f"[Error] fetching liquidity chase bias for {pair}: {e}")
 
