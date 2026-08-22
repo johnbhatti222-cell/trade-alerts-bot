@@ -1,1 +1,13 @@
-[]
+[
+  {
+    "symbol": "BTC/USD",
+    "timeframe": "5min",
+    "direction": "SHORT",
+    "entry": 77332.66,
+    "sl": 77638.88757142857,
+    "tp": 77244.2375,
+    "entry_time": "2026-08-22 12:45:00",
+    "status": "open",
+    "closed_time": null
+  }
+]
