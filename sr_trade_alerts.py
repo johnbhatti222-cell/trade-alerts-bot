@@ -1,13 +1,16 @@
 """
-Confluence Trade Alert Bot -> Telegram  ("Sniper" edition + outcome tracking + news blackout)
+Confluence Trade Alert Bot -> Telegram
+("Sniper" edition + outcome tracking + news blackout + multi-timeframe confluence)
 -------------------------------------------------------------------------------------------
 Sends Entry / SL / TP alerts for crypto + forex pairs, gated by:
   1. Price at a support/resistance zone
   2. An actual rejection candle confirming it (not just proximity)
-  3. Trend alignment (no counter-trend entries)
-  4. At least 2 of: RSI extreme, liquidity grab, unfilled FVG
-  5. Deduplication - won't re-alert the same setup every cycle
-  6. News blackout - pauses new signals around NFP / FOMC releases
+  3. Trend alignment on its own timeframe (no counter-trend entries)
+  4. Multi-timeframe confluence - a 15min signal must agree with the 1h trend;
+     bonus confluence if the 15min zone lines up with a 1h zone too
+  5. At least 2 of: RSI extreme, liquidity grab, unfilled FVG
+  6. Deduplication - won't re-alert the same setup every cycle
+  7. News blackout - pauses new signals around NFP / FOMC releases
 
 Also tracks whether each alert actually hit TP or SL, and sends a daily
 Telegram summary with win rate so you can judge if the system is any good.
@@ -43,7 +46,18 @@ PAIRS = [
     "USD/JPY",
 ]
 
-TIMEFRAMES = ["15min", "1h"]
+TIMEFRAMES = ["15min", "1h"]  # default, used for any pair not listed in PAIR_TIMEFRAMES below
+
+# Per-pair timeframe overrides. BTC/USD and XAU/USD get an extra 5min layer;
+# USD/JPY stays on 15min + 1h only (keeps total requests/day under the free API cap).
+PAIR_TIMEFRAMES = {
+    "BTC/USD": ["5min", "15min", "1h"],
+    "XAU/USD": ["5min", "15min", "1h"],
+    "USD/JPY": ["15min", "1h"],
+}
+
+HTF_FOR = {"5min": "15min", "15min": "1h"}   # maps a timeframe to the higher timeframe that must confirm it
+
 LOOKBACK_CANDLES = 150
 PIVOT_WINDOW = 5          # candles each side to confirm a swing high/low
 ZONE_MERGE_PCT = 0.15     # % distance to merge nearby levels into one zone
@@ -59,30 +73,29 @@ RSI_OVERBOUGHT = 65
 LIQUIDITY_WINDOW = 20     # candles searched for swept swing high/low
 FVG_LOOKBACK = 20         # candles searched for unfilled fair value gaps
 
-MIN_OPTIONAL_CONFLUENCE = 2   # of {RSI, liquidity grab, FVG}, how many required on top of the hard gates
+MIN_OPTIONAL_CONFLUENCE = 2   # of {RSI, liquidity grab, FVG, HTF zone alignment}, how many required
 
 # --- Sniper filters ---
 EMA_TREND_PERIOD = 50
 REJECTION_WICK_RATIO = 0.4     # wick must be >= 40% of the candle's range
 REJECTION_CLOSE_POSITION = 0.6 # close must sit in the outer 40% of the candle, favoring the reaction direction
 
+# --- Multi-timeframe confluence ---
+HTF_ZONE_TOLERANCE_PCT = 0.35  # how close a lower-TF zone must be to an HTF zone to count as "aligned"
+
 # --- Deduplication ---
 STATE_FILE = "state.json"
-COOLDOWN_HOURS = {"15min": 4, "1h": 10}   # don't re-alert same symbol+timeframe+direction within this window
+COOLDOWN_HOURS = {"5min": 2, "15min": 4, "1h": 10}   # don't re-alert same symbol+timeframe+direction within this window
 
 # --- Outcome tracking ---
 TRADE_LOG_FILE = "trade_log.json"
 
 # --- News blackout ---
-# Confirmed 2026 FOMC statement days (2:00pm ET), from federalreserve.gov.
-# Add next year's dates here once the Fed publishes them.
 FOMC_DATES_2026 = ["2026-09-16", "2026-10-28", "2026-12-09"]
 FOMC_TIME_ET = "14:00"
-NFP_MONTHS_AHEAD = 3          # auto-computes first Friday of each of the next N months, 8:30am ET
+NFP_MONTHS_AHEAD = 3
 BLACKOUT_BEFORE_MIN = 30
 BLACKOUT_AFTER_MIN = 60
-# Manually add other known high-impact events here if you want them covered, e.g.:
-# MANUAL_BLACKOUT_EVENTS = [("2026-09-10 12:30", "CPI Release")]  # UTC time, "YYYY-MM-DD HH:MM"
 MANUAL_BLACKOUT_EVENTS = []
 # =================================
 
@@ -258,6 +271,30 @@ def price_in_zone(price, zones, tolerance_pct=0.2):
     return False
 
 
+# ---------- Multi-timeframe confluence ----------
+def get_htf_bias(htf_data):
+    """Computes the higher-timeframe trend and nearest zones, used to gate/confirm lower-TF signals."""
+    closes, highs, lows = htf_data["close"], htf_data["high"], htf_data["low"]
+    trend = trend_direction(closes)
+    swing_highs, swing_lows = find_swing_points(highs, lows)
+    resistance_zones = merge_zones(swing_highs)
+    support_zones = merge_zones(swing_lows)
+    price_now = closes[-1]
+    supports_below = sorted([z for z in support_zones if z < price_now], reverse=True)
+    resistances_above = sorted([z for z in resistance_zones if z > price_now])
+    return {
+        "trend": trend,
+        "nearest_support": supports_below[0] if supports_below else None,
+        "nearest_resistance": resistances_above[0] if resistances_above else None,
+    }
+
+
+def zone_aligned_with_htf(zone, htf_zone, tolerance_pct=HTF_ZONE_TOLERANCE_PCT):
+    if htf_zone is None:
+        return False
+    return abs(zone - htf_zone) / htf_zone * 100 <= tolerance_pct
+
+
 # ---------- News blackout ----------
 def fomc_blackout_windows():
     windows = []
@@ -397,7 +434,7 @@ def maybe_send_daily_summary(state, trade_log):
     resolved = wins + losses
     if resolved == 0 and open_trades == 0:
         state["last_summary_date"] = today_str
-        return  # nothing to report yet, don't spam an empty summary
+        return
     msg = (
         f"📊 *Daily Summary*\n"
         f"Resolved trades: {resolved}\n"
@@ -410,7 +447,8 @@ def maybe_send_daily_summary(state, trade_log):
 
 
 # ---------- Core analysis ----------
-def analyze_pair(symbol: str, timeframe: str, data: dict, state: dict, trade_log: list, blackout_active: bool):
+def analyze_pair(symbol: str, timeframe: str, data: dict, state: dict, trade_log: list,
+                  blackout_active: bool, htf_bias: dict = None):
     times, opens, closes, highs, lows = (
         data["datetime"], data["open"], data["close"], data["high"], data["low"]
     )
@@ -439,78 +477,94 @@ def analyze_pair(symbol: str, timeframe: str, data: dict, state: dict, trade_log
 
     # --- LONG setup ---
     if supports_below and trend != "down":
-        zone = supports_below[0]
-        if check_reaction(price_now, closes, zone, "support") and has_rejection_candle(
-            opens, highs, lows, closes, "bullish"
-        ):
-            score = 0
-            tags = ["S/R reaction", "Rejection candle confirmed", f"Trend: {trend}"]
-            if current_rsi <= RSI_OVERSOLD:
-                score += 1
-                tags.append(f"RSI oversold ({current_rsi:.0f})")
-            if buy_grab:
-                score += 1
-                tags.append("Liquidity grab (buy-side)")
-            if price_in_zone(price_now, bull_fvgs):
-                score += 1
-                tags.append("Bullish FVG")
-            if score >= MIN_OPTIONAL_CONFLUENCE:
-                key = f"{symbol}_{timeframe}_LONG"
-                if already_alerted_recently(state, key, timeframe):
-                    print(f"[Deduped] {symbol} {timeframe} LONG - already alerted within cooldown")
-                else:
-                    entry = price_now
-                    structural_low = min(lows[-REACTION_LOOKBACK:])
-                    anchor = min(zone, structural_low)
-                    sl = anchor - (current_atr * SL_ATR_BUFFER)
-                    risk = entry - sl
-                    tp = resistances_above[0] if resistances_above else entry + risk * DEFAULT_RR
-                    rr = round((tp - entry) / risk, 2) if risk > 0 else 0
-                    alert_signal(symbol, timeframe, "LONG", entry, sl, tp, rr, tags)
-                    mark_alerted(state, key)
-                    log_trade(trade_log, symbol, timeframe, "LONG", entry, sl, tp, times[-1])
-                    signal_fired = True
+        # Multi-timeframe gate: don't take a long if the higher timeframe is bearish
+        htf_blocks_long = htf_bias is not None and htf_bias["trend"] == "down"
+        if not htf_blocks_long:
+            zone = supports_below[0]
+            if check_reaction(price_now, closes, zone, "support") and has_rejection_candle(
+                opens, highs, lows, closes, "bullish"
+            ):
+                score = 0
+                tags = ["S/R reaction", "Rejection candle confirmed", f"Trend: {trend}"]
+                if htf_bias is not None:
+                    tags.append(f"1H trend: {htf_bias['trend']}")
+                    if zone_aligned_with_htf(zone, htf_bias["nearest_support"]):
+                        score += 1
+                        tags.append("1H support zone alignment")
+                if current_rsi <= RSI_OVERSOLD:
+                    score += 1
+                    tags.append(f"RSI oversold ({current_rsi:.0f})")
+                if buy_grab:
+                    score += 1
+                    tags.append("Liquidity grab (buy-side)")
+                if price_in_zone(price_now, bull_fvgs):
+                    score += 1
+                    tags.append("Bullish FVG")
+                if score >= MIN_OPTIONAL_CONFLUENCE:
+                    key = f"{symbol}_{timeframe}_LONG"
+                    if already_alerted_recently(state, key, timeframe):
+                        print(f"[Deduped] {symbol} {timeframe} LONG - already alerted within cooldown")
+                    else:
+                        entry = price_now
+                        structural_low = min(lows[-REACTION_LOOKBACK:])
+                        anchor = min(zone, structural_low)
+                        sl = anchor - (current_atr * SL_ATR_BUFFER)
+                        risk = entry - sl
+                        tp = resistances_above[0] if resistances_above else entry + risk * DEFAULT_RR
+                        rr = round((tp - entry) / risk, 2) if risk > 0 else 0
+                        alert_signal(symbol, timeframe, "LONG", entry, sl, tp, rr, tags)
+                        mark_alerted(state, key)
+                        log_trade(trade_log, symbol, timeframe, "LONG", entry, sl, tp, times[-1])
+                        signal_fired = True
 
     # --- SHORT setup ---
     if resistances_above and trend != "up":
-        zone = resistances_above[0]
-        if check_reaction(price_now, closes, zone, "resistance") and has_rejection_candle(
-            opens, highs, lows, closes, "bearish"
-        ):
-            score = 0
-            tags = ["S/R reaction", "Rejection candle confirmed", f"Trend: {trend}"]
-            if current_rsi >= RSI_OVERBOUGHT:
-                score += 1
-                tags.append(f"RSI overbought ({current_rsi:.0f})")
-            if sell_grab:
-                score += 1
-                tags.append("Liquidity grab (sell-side)")
-            if price_in_zone(price_now, bear_fvgs):
-                score += 1
-                tags.append("Bearish FVG")
-            if score >= MIN_OPTIONAL_CONFLUENCE:
-                key = f"{symbol}_{timeframe}_SHORT"
-                if already_alerted_recently(state, key, timeframe):
-                    print(f"[Deduped] {symbol} {timeframe} SHORT - already alerted within cooldown")
-                else:
-                    entry = price_now
-                    structural_high = max(highs[-REACTION_LOOKBACK:])
-                    anchor = max(zone, structural_high)
-                    sl = anchor + (current_atr * SL_ATR_BUFFER)
-                    risk = sl - entry
-                    tp = supports_below[0] if supports_below else entry - risk * DEFAULT_RR
-                    rr = round((entry - tp) / risk, 2) if risk > 0 else 0
-                    alert_signal(symbol, timeframe, "SHORT", entry, sl, tp, rr, tags)
-                    mark_alerted(state, key)
-                    log_trade(trade_log, symbol, timeframe, "SHORT", entry, sl, tp, times[-1])
-                    signal_fired = True
+        htf_blocks_short = htf_bias is not None and htf_bias["trend"] == "up"
+        if not htf_blocks_short:
+            zone = resistances_above[0]
+            if check_reaction(price_now, closes, zone, "resistance") and has_rejection_candle(
+                opens, highs, lows, closes, "bearish"
+            ):
+                score = 0
+                tags = ["S/R reaction", "Rejection candle confirmed", f"Trend: {trend}"]
+                if htf_bias is not None:
+                    tags.append(f"1H trend: {htf_bias['trend']}")
+                    if zone_aligned_with_htf(zone, htf_bias["nearest_resistance"]):
+                        score += 1
+                        tags.append("1H resistance zone alignment")
+                if current_rsi >= RSI_OVERBOUGHT:
+                    score += 1
+                    tags.append(f"RSI overbought ({current_rsi:.0f})")
+                if sell_grab:
+                    score += 1
+                    tags.append("Liquidity grab (sell-side)")
+                if price_in_zone(price_now, bear_fvgs):
+                    score += 1
+                    tags.append("Bearish FVG")
+                if score >= MIN_OPTIONAL_CONFLUENCE:
+                    key = f"{symbol}_{timeframe}_SHORT"
+                    if already_alerted_recently(state, key, timeframe):
+                        print(f"[Deduped] {symbol} {timeframe} SHORT - already alerted within cooldown")
+                    else:
+                        entry = price_now
+                        structural_high = max(highs[-REACTION_LOOKBACK:])
+                        anchor = max(zone, structural_high)
+                        sl = anchor + (current_atr * SL_ATR_BUFFER)
+                        risk = sl - entry
+                        tp = supports_below[0] if supports_below else entry - risk * DEFAULT_RR
+                        rr = round((entry - tp) / risk, 2) if risk > 0 else 0
+                        alert_signal(symbol, timeframe, "SHORT", entry, sl, tp, rr, tags)
+                        mark_alerted(state, key)
+                        log_trade(trade_log, symbol, timeframe, "SHORT", entry, sl, tp, times[-1])
+                        signal_fired = True
 
     if not signal_fired:
         near_support = f"{supports_below[0]:.5f}" if supports_below else "none"
         near_resistance = f"{resistances_above[0]:.5f}" if resistances_above else "none"
+        htf_note = f" htf_trend={htf_bias['trend']}" if htf_bias is not None else ""
         print(
             f"[No signal] {symbol} {timeframe}: price={price_now:.5f} "
-            f"RSI={current_rsi:.0f} trend={trend} nearest_support={near_support} "
+            f"RSI={current_rsi:.0f} trend={trend}{htf_note} nearest_support={near_support} "
             f"nearest_resistance={near_resistance}"
         )
 
@@ -540,16 +594,35 @@ def run_once():
         print(f"[Blackout] Active: {blackout_name} - pausing new signal generation this run")
 
     for pair in PAIRS:
-        for tf in TIMEFRAMES:
+        pair_tfs = PAIR_TIMEFRAMES.get(pair, TIMEFRAMES)
+        candle_data = {}
+        for tf in pair_tfs:
             try:
                 data = fetch_candles(pair, tf)
-                if data is None:
-                    continue
-                check_open_trades(pair, tf, data, trade_log)
-                analyze_pair(pair, tf, data, state, trade_log, blackout_active)
+                if data is not None:
+                    candle_data[tf] = data
             except Exception as e:
-                print(f"[Error] {pair} {tf}: {e}")
+                print(f"[Error] fetching {pair} {tf}: {e}")
             time.sleep(1)  # avoid hammering free-tier rate limits
+
+        # Compute higher-timeframe bias once per pair, reused as a gate for the lower timeframe
+        htf_biases = {}
+        for tf, htf in HTF_FOR.items():
+            if tf in pair_tfs and htf in candle_data:
+                try:
+                    htf_biases[tf] = get_htf_bias(candle_data[htf])
+                except Exception as e:
+                    print(f"[Error] computing HTF bias for {pair} ({htf}): {e}")
+
+        for tf in pair_tfs:
+            if tf not in candle_data:
+                continue
+            data = candle_data[tf]
+            try:
+                check_open_trades(pair, tf, data, trade_log)
+                analyze_pair(pair, tf, data, state, trade_log, blackout_active, htf_bias=htf_biases.get(tf))
+            except Exception as e:
+                print(f"[Error] analyzing {pair} {tf}: {e}")
 
     maybe_send_daily_summary(state, trade_log)
     save_json(STATE_FILE, state)
