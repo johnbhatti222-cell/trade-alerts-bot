@@ -1,12 +1,16 @@
 """
-Confluence Trade Alert Bot -> Telegram  ("Sniper" edition)
-------------------------------------------------------------
+Confluence Trade Alert Bot -> Telegram  ("Sniper" edition + outcome tracking + news blackout)
+-------------------------------------------------------------------------------------------
 Sends Entry / SL / TP alerts for crypto + forex pairs, gated by:
   1. Price at a support/resistance zone
   2. An actual rejection candle confirming it (not just proximity)
   3. Trend alignment (no counter-trend entries)
   4. At least 2 of: RSI extreme, liquidity grab, unfilled FVG
   5. Deduplication - won't re-alert the same setup every cycle
+  6. News blackout - pauses new signals around NFP / FOMC releases
+
+Also tracks whether each alert actually hit TP or SL, and sends a daily
+Telegram summary with win rate so you can judge if the system is any good.
 
 Runs on 15min and 1h.
 
@@ -21,7 +25,8 @@ For GitHub Actions automation, see SETUP.md
 import os
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 import numpy as np
@@ -64,7 +69,24 @@ REJECTION_CLOSE_POSITION = 0.6 # close must sit in the outer 40% of the candle, 
 # --- Deduplication ---
 STATE_FILE = "state.json"
 COOLDOWN_HOURS = {"15min": 4, "1h": 10}   # don't re-alert same symbol+timeframe+direction within this window
+
+# --- Outcome tracking ---
+TRADE_LOG_FILE = "trade_log.json"
+
+# --- News blackout ---
+# Confirmed 2026 FOMC statement days (2:00pm ET), from federalreserve.gov.
+# Add next year's dates here once the Fed publishes them.
+FOMC_DATES_2026 = ["2026-09-16", "2026-10-28", "2026-12-09"]
+FOMC_TIME_ET = "14:00"
+NFP_MONTHS_AHEAD = 3          # auto-computes first Friday of each of the next N months, 8:30am ET
+BLACKOUT_BEFORE_MIN = 30
+BLACKOUT_AFTER_MIN = 60
+# Manually add other known high-impact events here if you want them covered, e.g.:
+# MANUAL_BLACKOUT_EVENTS = [("2026-09-10 12:30", "CPI Release")]  # UTC time, "YYYY-MM-DD HH:MM"
+MANUAL_BLACKOUT_EVENTS = []
 # =================================
+
+NY_TZ = ZoneInfo("America/New_York")
 
 
 def send_telegram(message: str):
@@ -93,11 +115,12 @@ def fetch_candles(symbol: str, interval: str):
     if "values" not in data:
         print(f"[Data error] {symbol} {interval}: {data}")
         return None
+    times = [c["datetime"] for c in data["values"]]
     opens = np.array([float(c["open"]) for c in data["values"]])
     closes = np.array([float(c["close"]) for c in data["values"]])
     highs = np.array([float(c["high"]) for c in data["values"]])
     lows = np.array([float(c["low"]) for c in data["values"]])
-    return {"open": opens, "high": highs, "low": lows, "close": closes}
+    return {"datetime": times, "open": opens, "high": highs, "low": lows, "close": closes}
 
 
 def atr(highs, lows, closes, period=ATR_PERIOD):
@@ -138,7 +161,6 @@ def ema_series(closes, period):
 
 
 def trend_direction(closes, period=EMA_TREND_PERIOD):
-    """Returns 'up', 'down', or 'flat' based on price vs EMA and EMA slope."""
     if len(closes) < period + 5:
         return "flat"
     ema = ema_series(closes, period)
@@ -185,14 +207,12 @@ def check_reaction(price_now, closes, zone, direction, tolerance_pct=0.25):
 
 
 def has_rejection_candle(opens, highs, lows, closes, direction):
-    """Checks the most recent candles for a genuine rejection wick + strong close,
-    rather than just price sitting near a zone."""
     for i in range(-REACTION_LOOKBACK, 0):
         o, h, l, c = opens[i], highs[i], lows[i], closes[i]
         rng = h - l
         if rng <= 0:
             continue
-        close_pos = (c - l) / rng  # 0 = closed at low, 1 = closed at high
+        close_pos = (c - l) / rng
         lower_wick = min(o, c) - l
         upper_wick = h - max(o, c)
         if direction == "bullish":
@@ -210,8 +230,8 @@ def detect_liquidity_grab(highs, lows, closes, window=LIQUIDITY_WINDOW):
     recent_high = max(highs[-window:-1])
     recent_low = min(lows[-window:-1])
     last_high, last_low, last_close = highs[-1], lows[-1], closes[-1]
-    buy_side_grab = last_low < recent_low and last_close > recent_low   # swept lows, closed back above -> bullish
-    sell_side_grab = last_high > recent_high and last_close < recent_high  # swept highs, closed back below -> bearish
+    buy_side_grab = last_low < recent_low and last_close > recent_low
+    sell_side_grab = last_high > recent_high and last_close < recent_high
     return buy_side_grab, sell_side_grab
 
 
@@ -238,20 +258,70 @@ def price_in_zone(price, zones, tolerance_pct=0.2):
     return False
 
 
+# ---------- News blackout ----------
+def fomc_blackout_windows():
+    windows = []
+    for d in FOMC_DATES_2026:
+        dt_et = datetime.strptime(f"{d} {FOMC_TIME_ET}", "%Y-%m-%d %H:%M").replace(tzinfo=NY_TZ)
+        windows.append((dt_et.astimezone(timezone.utc), "FOMC Rate Decision"))
+    return windows
+
+
+def nfp_blackout_windows(months_ahead=NFP_MONTHS_AHEAD):
+    windows = []
+    today = datetime.now(timezone.utc)
+    for i in range(months_ahead):
+        month = today.month + i
+        year = today.year + (month - 1) // 12
+        month = (month - 1) % 12 + 1
+        d = datetime(year, month, 1)
+        while d.weekday() != 4:  # Friday
+            d += timedelta(days=1)
+        dt_et = d.replace(hour=8, minute=30, tzinfo=NY_TZ)
+        windows.append((dt_et.astimezone(timezone.utc), "NFP (Non-Farm Payrolls)"))
+    return windows
+
+
+def manual_blackout_windows():
+    windows = []
+    for time_str, name in MANUAL_BLACKOUT_EVENTS:
+        dt_utc = datetime.strptime(time_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+        windows.append((dt_utc, name))
+    return windows
+
+
+def is_blackout(now_utc=None):
+    now = now_utc or datetime.now(timezone.utc)
+    events = fomc_blackout_windows() + nfp_blackout_windows() + manual_blackout_windows()
+    for event_time, name in events:
+        delta_min = (now - event_time).total_seconds() / 60
+        if -BLACKOUT_BEFORE_MIN <= delta_min <= BLACKOUT_AFTER_MIN:
+            return True, name
+    return False, None
+
+
 # ---------- Deduplication state ----------
-def load_state():
-    if os.path.exists(STATE_FILE):
+def load_json(path):
+    if os.path.exists(path):
         try:
-            with open(STATE_FILE, "r") as f:
+            with open(path, "r") as f:
                 return json.load(f)
         except Exception:
-            return {}
-    return {}
+            return None
+    return None
 
 
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+def save_json(path, obj):
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
+
+
+def load_state():
+    return load_json(STATE_FILE) or {}
+
+
+def load_trade_log():
+    return load_json(TRADE_LOG_FILE) or []
 
 
 def already_alerted_recently(state, key, timeframe):
@@ -267,12 +337,83 @@ def mark_alerted(state, key):
     state[key] = datetime.now(timezone.utc).isoformat()
 
 
-# ---------- Core analysis ----------
-def analyze_pair(symbol: str, timeframe: str, state: dict):
-    data = fetch_candles(symbol, timeframe)
-    if data is None:
+# ---------- Outcome tracking ----------
+def log_trade(trade_log, symbol, timeframe, direction, entry, sl, tp, entry_time):
+    trade_log.append({
+        "symbol": symbol, "timeframe": timeframe, "direction": direction,
+        "entry": entry, "sl": sl, "tp": tp,
+        "entry_time": entry_time, "status": "open", "closed_time": None,
+    })
+
+
+def check_open_trades(symbol, timeframe, data, trade_log):
+    times, highs, lows = data["datetime"], data["high"], data["low"]
+    for trade in trade_log:
+        if trade["status"] != "open":
+            continue
+        if trade["symbol"] != symbol or trade["timeframe"] != timeframe:
+            continue
+        for i, t in enumerate(times):
+            if t <= trade["entry_time"]:
+                continue
+            if trade["direction"] == "LONG":
+                if lows[i] <= trade["sl"]:
+                    trade["status"], trade["closed_time"] = "LOSS", t
+                    break
+                if highs[i] >= trade["tp"]:
+                    trade["status"], trade["closed_time"] = "WIN", t
+                    break
+            else:
+                if highs[i] >= trade["sl"]:
+                    trade["status"], trade["closed_time"] = "LOSS", t
+                    break
+                if lows[i] <= trade["tp"]:
+                    trade["status"], trade["closed_time"] = "WIN", t
+                    break
+        if trade["status"] != "open":
+            emoji = "✅" if trade["status"] == "WIN" else "❌"
+            send_telegram(
+                f"{emoji} *{trade['symbol']} {trade['direction']}* ({trade['timeframe']}) "
+                f"closed: *{trade['status']}*\nEntry: `{trade['entry']:.5f}` -> "
+                f"{'TP' if trade['status']=='WIN' else 'SL'}: "
+                f"`{trade['tp'] if trade['status']=='WIN' else trade['sl']:.5f}`"
+            )
+
+
+def compute_stats(trade_log):
+    wins = sum(1 for t in trade_log if t["status"] == "WIN")
+    losses = sum(1 for t in trade_log if t["status"] == "LOSS")
+    open_trades = sum(1 for t in trade_log if t["status"] == "open")
+    resolved = wins + losses
+    win_rate = (wins / resolved * 100) if resolved else 0
+    return wins, losses, open_trades, win_rate
+
+
+def maybe_send_daily_summary(state, trade_log):
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if state.get("last_summary_date") == today_str:
         return
-    opens, closes, highs, lows = data["open"], data["close"], data["high"], data["low"]
+    wins, losses, open_trades, win_rate = compute_stats(trade_log)
+    resolved = wins + losses
+    if resolved == 0 and open_trades == 0:
+        state["last_summary_date"] = today_str
+        return  # nothing to report yet, don't spam an empty summary
+    msg = (
+        f"📊 *Daily Summary*\n"
+        f"Resolved trades: {resolved}\n"
+        f"Wins: {wins}   Losses: {losses}\n"
+        f"Win rate: {win_rate:.1f}%\n"
+        f"Open trades: {open_trades}"
+    )
+    send_telegram(msg)
+    state["last_summary_date"] = today_str
+
+
+# ---------- Core analysis ----------
+def analyze_pair(symbol: str, timeframe: str, data: dict, state: dict, trade_log: list, blackout_active: bool):
+    times, opens, closes, highs, lows = (
+        data["datetime"], data["open"], data["close"], data["high"], data["low"]
+    )
     if len(closes) < max(30, EMA_TREND_PERIOD + 5):
         print(f"[Skip] {symbol} {timeframe}: not enough candles ({len(closes)})")
         return
@@ -292,7 +433,11 @@ def analyze_pair(symbol: str, timeframe: str, state: dict):
 
     signal_fired = False
 
-    # --- LONG setup: needs uptrend or flat (never counter-trend against 'down') ---
+    if blackout_active:
+        print(f"[Blackout] {symbol} {timeframe}: new signal generation paused")
+        return
+
+    # --- LONG setup ---
     if supports_below and trend != "down":
         zone = supports_below[0]
         if check_reaction(price_now, closes, zone, "support") and has_rejection_candle(
@@ -323,9 +468,10 @@ def analyze_pair(symbol: str, timeframe: str, state: dict):
                     rr = round((tp - entry) / risk, 2) if risk > 0 else 0
                     alert_signal(symbol, timeframe, "LONG", entry, sl, tp, rr, tags)
                     mark_alerted(state, key)
+                    log_trade(trade_log, symbol, timeframe, "LONG", entry, sl, tp, times[-1])
                     signal_fired = True
 
-    # --- SHORT setup: needs downtrend or flat (never counter-trend against 'up') ---
+    # --- SHORT setup ---
     if resistances_above and trend != "up":
         zone = resistances_above[0]
         if check_reaction(price_now, closes, zone, "resistance") and has_rejection_candle(
@@ -356,6 +502,7 @@ def analyze_pair(symbol: str, timeframe: str, state: dict):
                     rr = round((entry - tp) / risk, 2) if risk > 0 else 0
                     alert_signal(symbol, timeframe, "SHORT", entry, sl, tp, rr, tags)
                     mark_alerted(state, key)
+                    log_trade(trade_log, symbol, timeframe, "SHORT", entry, sl, tp, times[-1])
                     signal_fired = True
 
     if not signal_fired:
@@ -386,14 +533,30 @@ def alert_signal(symbol, timeframe, direction, entry, sl, tp, rr, tags):
 
 def run_once():
     state = load_state()
+    trade_log = load_trade_log()
+
+    blackout_active, blackout_name = is_blackout()
+    if blackout_active:
+        print(f"[Blackout] Active: {blackout_name} - pausing new signal generation this run")
+
     for pair in PAIRS:
         for tf in TIMEFRAMES:
             try:
-                analyze_pair(pair, tf, state)
+                data = fetch_candles(pair, tf)
+                if data is None:
+                    continue
+                check_open_trades(pair, tf, data, trade_log)
+                analyze_pair(pair, tf, data, state, trade_log, blackout_active)
             except Exception as e:
                 print(f"[Error] {pair} {tf}: {e}")
             time.sleep(1)  # avoid hammering free-tier rate limits
-    save_state(state)
+
+    maybe_send_daily_summary(state, trade_log)
+    save_json(STATE_FILE, state)
+    save_json(TRADE_LOG_FILE, trade_log)
+
+    wins, losses, open_trades, win_rate = compute_stats(trade_log)
+    print(f"[Stats] Resolved={wins + losses} Wins={wins} Losses={losses} WinRate={win_rate:.1f}% Open={open_trades}")
 
 
 if __name__ == "__main__":
