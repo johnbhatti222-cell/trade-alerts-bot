@@ -1,9 +1,14 @@
 """
-Confluence Trade Alert Bot -> Telegram
-------------------------------------------------
-Sends Entry / SL / TP alerts for crypto + forex pairs based on a
-confluence of: Support/Resistance reaction, RSI, Liquidity Grabs
-(stop hunts), and Fair Value Gaps (FVGs). Runs on 15min and 1h.
+Confluence Trade Alert Bot -> Telegram  ("Sniper" edition)
+------------------------------------------------------------
+Sends Entry / SL / TP alerts for crypto + forex pairs, gated by:
+  1. Price at a support/resistance zone
+  2. An actual rejection candle confirming it (not just proximity)
+  3. Trend alignment (no counter-trend entries)
+  4. At least 2 of: RSI extreme, liquidity grab, unfilled FVG
+  5. Deduplication - won't re-alert the same setup every cycle
+
+Runs on 15min and 1h.
 
 SETUP (local test):
 1. pip install -r requirements.txt
@@ -14,7 +19,10 @@ For GitHub Actions automation, see SETUP.md
 """
 
 import os
+import json
 import time
+from datetime import datetime, timezone
+
 import requests
 import numpy as np
 
@@ -46,7 +54,16 @@ RSI_OVERBOUGHT = 65
 LIQUIDITY_WINDOW = 20     # candles searched for swept swing high/low
 FVG_LOOKBACK = 20         # candles searched for unfilled fair value gaps
 
-MIN_CONFLUENCE = 2        # S/R reaction (1) + at least one more factor
+MIN_OPTIONAL_CONFLUENCE = 2   # of {RSI, liquidity grab, FVG}, how many required on top of the hard gates
+
+# --- Sniper filters ---
+EMA_TREND_PERIOD = 50
+REJECTION_WICK_RATIO = 0.4     # wick must be >= 40% of the candle's range
+REJECTION_CLOSE_POSITION = 0.6 # close must sit in the outer 40% of the candle, favoring the reaction direction
+
+# --- Deduplication ---
+STATE_FILE = "state.json"
+COOLDOWN_HOURS = {"15min": 4, "1h": 10}   # don't re-alert same symbol+timeframe+direction within this window
 # =================================
 
 
@@ -76,10 +93,11 @@ def fetch_candles(symbol: str, interval: str):
     if "values" not in data:
         print(f"[Data error] {symbol} {interval}: {data}")
         return None
+    opens = np.array([float(c["open"]) for c in data["values"]])
     closes = np.array([float(c["close"]) for c in data["values"]])
     highs = np.array([float(c["high"]) for c in data["values"]])
     lows = np.array([float(c["low"]) for c in data["values"]])
-    return {"high": highs, "low": lows, "close": closes}
+    return {"open": opens, "high": highs, "low": lows, "close": closes}
 
 
 def atr(highs, lows, closes, period=ATR_PERIOD):
@@ -108,6 +126,31 @@ def rsi(closes, period=RSI_PERIOD):
         return 100
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
+
+
+def ema_series(closes, period):
+    ema = np.zeros_like(closes)
+    ema[0] = closes[0]
+    k = 2 / (period + 1)
+    for i in range(1, len(closes)):
+        ema[i] = closes[i] * k + ema[i - 1] * (1 - k)
+    return ema
+
+
+def trend_direction(closes, period=EMA_TREND_PERIOD):
+    """Returns 'up', 'down', or 'flat' based on price vs EMA and EMA slope."""
+    if len(closes) < period + 5:
+        return "flat"
+    ema = ema_series(closes, period)
+    price_above = closes[-1] > ema[-1]
+    price_below = closes[-1] < ema[-1]
+    slope_up = ema[-1] > ema[-5]
+    slope_down = ema[-1] < ema[-5]
+    if price_above and slope_up:
+        return "up"
+    if price_below and slope_down:
+        return "down"
+    return "flat"
 
 
 def find_swing_points(highs, lows, window=PIVOT_WINDOW):
@@ -139,6 +182,26 @@ def check_reaction(price_now, closes, zone, direction, tolerance_pct=0.25):
     if not touched:
         return False
     return price_now > zone if direction == "support" else price_now < zone
+
+
+def has_rejection_candle(opens, highs, lows, closes, direction):
+    """Checks the most recent candles for a genuine rejection wick + strong close,
+    rather than just price sitting near a zone."""
+    for i in range(-REACTION_LOOKBACK, 0):
+        o, h, l, c = opens[i], highs[i], lows[i], closes[i]
+        rng = h - l
+        if rng <= 0:
+            continue
+        close_pos = (c - l) / rng  # 0 = closed at low, 1 = closed at high
+        lower_wick = min(o, c) - l
+        upper_wick = h - max(o, c)
+        if direction == "bullish":
+            if lower_wick / rng >= REJECTION_WICK_RATIO and close_pos >= REJECTION_CLOSE_POSITION:
+                return True
+        else:
+            if upper_wick / rng >= REJECTION_WICK_RATIO and (1 - close_pos) >= REJECTION_CLOSE_POSITION:
+                return True
+    return False
 
 
 def detect_liquidity_grab(highs, lows, closes, window=LIQUIDITY_WINDOW):
@@ -175,12 +238,42 @@ def price_in_zone(price, zones, tolerance_pct=0.2):
     return False
 
 
-def analyze_pair(symbol: str, timeframe: str):
+# ---------- Deduplication state ----------
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def already_alerted_recently(state, key, timeframe):
+    last = state.get(key)
+    if not last:
+        return False
+    last_time = datetime.fromisoformat(last)
+    elapsed_hours = (datetime.now(timezone.utc) - last_time).total_seconds() / 3600
+    return elapsed_hours < COOLDOWN_HOURS.get(timeframe, 4)
+
+
+def mark_alerted(state, key):
+    state[key] = datetime.now(timezone.utc).isoformat()
+
+
+# ---------- Core analysis ----------
+def analyze_pair(symbol: str, timeframe: str, state: dict):
     data = fetch_candles(symbol, timeframe)
     if data is None:
         return
-    closes, highs, lows = data["close"], data["high"], data["low"]
-    if len(closes) < 30:
+    opens, closes, highs, lows = data["open"], data["close"], data["high"], data["low"]
+    if len(closes) < max(30, EMA_TREND_PERIOD + 5):
         print(f"[Skip] {symbol} {timeframe}: not enough candles ({len(closes)})")
         return
 
@@ -189,6 +282,7 @@ def analyze_pair(symbol: str, timeframe: str):
     current_rsi = rsi(closes)
     buy_grab, sell_grab = detect_liquidity_grab(highs, lows, closes)
     bull_fvgs, bear_fvgs = find_unfilled_fvgs(highs, lows, closes)
+    trend = trend_direction(closes)
 
     swing_highs, swing_lows = find_swing_points(highs, lows)
     resistance_zones = merge_zones(swing_highs)
@@ -198,12 +292,14 @@ def analyze_pair(symbol: str, timeframe: str):
 
     signal_fired = False
 
-    # --- LONG setup ---
-    if supports_below:
+    # --- LONG setup: needs uptrend or flat (never counter-trend against 'down') ---
+    if supports_below and trend != "down":
         zone = supports_below[0]
-        if check_reaction(price_now, closes, zone, "support"):
-            score = 1
-            tags = ["S/R reaction"]
+        if check_reaction(price_now, closes, zone, "support") and has_rejection_candle(
+            opens, highs, lows, closes, "bullish"
+        ):
+            score = 0
+            tags = ["S/R reaction", "Rejection candle confirmed", f"Trend: {trend}"]
             if current_rsi <= RSI_OVERSOLD:
                 score += 1
                 tags.append(f"RSI oversold ({current_rsi:.0f})")
@@ -213,23 +309,30 @@ def analyze_pair(symbol: str, timeframe: str):
             if price_in_zone(price_now, bull_fvgs):
                 score += 1
                 tags.append("Bullish FVG")
-            if score >= MIN_CONFLUENCE:
-                entry = price_now
-                structural_low = min(lows[-REACTION_LOOKBACK:])
-                anchor = min(zone, structural_low)
-                sl = anchor - (current_atr * SL_ATR_BUFFER)
-                risk = entry - sl
-                tp = resistances_above[0] if resistances_above else entry + risk * DEFAULT_RR
-                rr = round((tp - entry) / risk, 2) if risk > 0 else 0
-                alert_signal(symbol, timeframe, "LONG", entry, sl, tp, rr, tags)
-                signal_fired = True
+            if score >= MIN_OPTIONAL_CONFLUENCE:
+                key = f"{symbol}_{timeframe}_LONG"
+                if already_alerted_recently(state, key, timeframe):
+                    print(f"[Deduped] {symbol} {timeframe} LONG - already alerted within cooldown")
+                else:
+                    entry = price_now
+                    structural_low = min(lows[-REACTION_LOOKBACK:])
+                    anchor = min(zone, structural_low)
+                    sl = anchor - (current_atr * SL_ATR_BUFFER)
+                    risk = entry - sl
+                    tp = resistances_above[0] if resistances_above else entry + risk * DEFAULT_RR
+                    rr = round((tp - entry) / risk, 2) if risk > 0 else 0
+                    alert_signal(symbol, timeframe, "LONG", entry, sl, tp, rr, tags)
+                    mark_alerted(state, key)
+                    signal_fired = True
 
-    # --- SHORT setup ---
-    if resistances_above:
+    # --- SHORT setup: needs downtrend or flat (never counter-trend against 'up') ---
+    if resistances_above and trend != "up":
         zone = resistances_above[0]
-        if check_reaction(price_now, closes, zone, "resistance"):
-            score = 1
-            tags = ["S/R reaction"]
+        if check_reaction(price_now, closes, zone, "resistance") and has_rejection_candle(
+            opens, highs, lows, closes, "bearish"
+        ):
+            score = 0
+            tags = ["S/R reaction", "Rejection candle confirmed", f"Trend: {trend}"]
             if current_rsi >= RSI_OVERBOUGHT:
                 score += 1
                 tags.append(f"RSI overbought ({current_rsi:.0f})")
@@ -239,29 +342,34 @@ def analyze_pair(symbol: str, timeframe: str):
             if price_in_zone(price_now, bear_fvgs):
                 score += 1
                 tags.append("Bearish FVG")
-            if score >= MIN_CONFLUENCE:
-                entry = price_now
-                structural_high = max(highs[-REACTION_LOOKBACK:])
-                anchor = max(zone, structural_high)
-                sl = anchor + (current_atr * SL_ATR_BUFFER)
-                risk = sl - entry
-                tp = supports_below[0] if supports_below else entry - risk * DEFAULT_RR
-                rr = round((entry - tp) / risk, 2) if risk > 0 else 0
-                alert_signal(symbol, timeframe, "SHORT", entry, sl, tp, rr, tags)
-                signal_fired = True
+            if score >= MIN_OPTIONAL_CONFLUENCE:
+                key = f"{symbol}_{timeframe}_SHORT"
+                if already_alerted_recently(state, key, timeframe):
+                    print(f"[Deduped] {symbol} {timeframe} SHORT - already alerted within cooldown")
+                else:
+                    entry = price_now
+                    structural_high = max(highs[-REACTION_LOOKBACK:])
+                    anchor = max(zone, structural_high)
+                    sl = anchor + (current_atr * SL_ATR_BUFFER)
+                    risk = sl - entry
+                    tp = supports_below[0] if supports_below else entry - risk * DEFAULT_RR
+                    rr = round((entry - tp) / risk, 2) if risk > 0 else 0
+                    alert_signal(symbol, timeframe, "SHORT", entry, sl, tp, rr, tags)
+                    mark_alerted(state, key)
+                    signal_fired = True
 
     if not signal_fired:
         near_support = f"{supports_below[0]:.5f}" if supports_below else "none"
         near_resistance = f"{resistances_above[0]:.5f}" if resistances_above else "none"
         print(
             f"[No signal] {symbol} {timeframe}: price={price_now:.5f} "
-            f"RSI={current_rsi:.0f} nearest_support={near_support} "
+            f"RSI={current_rsi:.0f} trend={trend} nearest_support={near_support} "
             f"nearest_resistance={near_resistance}"
         )
 
 
 def alert_signal(symbol, timeframe, direction, entry, sl, tp, rr, tags):
-    emoji = "🟢" if direction == "LONG" else "🔴"
+    emoji = "🎯"
     tag_str = "\n".join(f"  • {t}" for t in tags)
     msg = (
         f"{emoji} *{symbol} - {direction}* ({timeframe})\n\n"
@@ -277,13 +385,15 @@ def alert_signal(symbol, timeframe, direction, entry, sl, tp, rr, tags):
 
 
 def run_once():
+    state = load_state()
     for pair in PAIRS:
         for tf in TIMEFRAMES:
             try:
-                analyze_pair(pair, tf)
+                analyze_pair(pair, tf, state)
             except Exception as e:
                 print(f"[Error] {pair} {tf}: {e}")
             time.sleep(1)  # avoid hammering free-tier rate limits
+    save_state(state)
 
 
 if __name__ == "__main__":
