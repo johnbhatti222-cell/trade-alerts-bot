@@ -58,7 +58,7 @@ PAIR_TIMEFRAMES = {
 
 HTF_FOR = {"5min": "15min", "15min": "1h"}   # maps a timeframe to the higher timeframe that must confirm it
 
-LOOKBACK_CANDLES = 150
+LOOKBACK_CANDLES = 400    # generous history so the 200 EMA has room to stabilize
 PIVOT_WINDOW = 5          # candles each side to confirm a swing high/low
 ZONE_MERGE_PCT = 0.15     # % distance to merge nearby levels into one zone
 ATR_PERIOD = 14
@@ -73,10 +73,18 @@ RSI_OVERBOUGHT = 65
 LIQUIDITY_WINDOW = 20     # candles searched for swept swing high/low
 FVG_LOOKBACK = 20         # candles searched for unfilled fair value gaps
 
+# --- Volume confirmation ---
+# Only meaningful where real traded volume exists (mainly crypto - BTC/USD).
+# Forex (USD/JPY) and spot gold (XAU/USD) trade OTC with no central volume figure,
+# so this automatically no-ops for them rather than using a placeholder number.
+VOLUME_SPIKE_WINDOW = 20
+VOLUME_SPIKE_MULTIPLIER = 1.5
+
 MIN_OPTIONAL_CONFLUENCE = 2   # of {RSI, liquidity grab, FVG, HTF zone alignment}, how many required
 
 # --- Sniper filters ---
-EMA_TREND_PERIOD = 50
+EMA_FAST_PERIOD = 50
+EMA_SLOW_PERIOD = 200
 REJECTION_WICK_RATIO = 0.4     # wick must be >= 40% of the candle's range
 REJECTION_CLOSE_POSITION = 0.6 # close must sit in the outer 40% of the candle, favoring the reaction direction
 
@@ -133,7 +141,17 @@ def fetch_candles(symbol: str, interval: str):
     closes = np.array([float(c["close"]) for c in data["values"]])
     highs = np.array([float(c["high"]) for c in data["values"]])
     lows = np.array([float(c["low"]) for c in data["values"]])
-    return {"datetime": times, "open": opens, "high": highs, "low": lows, "close": closes}
+    volumes = []
+    for c in data["values"]:
+        try:
+            volumes.append(float(c.get("volume") or 0.0))
+        except (TypeError, ValueError):
+            volumes.append(0.0)
+    volumes = np.array(volumes)
+    return {
+        "datetime": times, "open": opens, "high": highs, "low": lows,
+        "close": closes, "volume": volumes,
+    }
 
 
 def atr(highs, lows, closes, period=ATR_PERIOD):
@@ -173,17 +191,28 @@ def ema_series(closes, period):
     return ema
 
 
-def trend_direction(closes, period=EMA_TREND_PERIOD):
-    if len(closes) < period + 5:
+def trend_direction(closes, fast_period=EMA_FAST_PERIOD, slow_period=EMA_SLOW_PERIOD):
+    """
+    'up'   -> fast EMA above slow EMA, fast EMA rising, price above both
+    'down' -> fast EMA below slow EMA, fast EMA falling, price below both
+    'flat' -> anything else (EMAs crossing, price caught between them, etc.)
+    """
+    if len(closes) < slow_period + 10:
         return "flat"
-    ema = ema_series(closes, period)
-    price_above = closes[-1] > ema[-1]
-    price_below = closes[-1] < ema[-1]
-    slope_up = ema[-1] > ema[-5]
-    slope_down = ema[-1] < ema[-5]
-    if price_above and slope_up:
+    ema_fast = ema_series(closes, fast_period)
+    ema_slow = ema_series(closes, slow_period)
+    price = closes[-1]
+
+    fast_above_slow = ema_fast[-1] > ema_slow[-1]
+    fast_below_slow = ema_fast[-1] < ema_slow[-1]
+    fast_slope_up = ema_fast[-1] > ema_fast[-5]
+    fast_slope_down = ema_fast[-1] < ema_fast[-5]
+    price_above_both = price > ema_fast[-1] and price > ema_slow[-1]
+    price_below_both = price < ema_fast[-1] and price < ema_slow[-1]
+
+    if fast_above_slow and fast_slope_up and price_above_both:
         return "up"
-    if price_below and slope_down:
+    if fast_below_slow and fast_slope_down and price_below_both:
         return "down"
     return "flat"
 
@@ -269,6 +298,26 @@ def price_in_zone(price, zones, tolerance_pct=0.2):
         if lo_t <= price <= hi_t:
             return True
     return False
+
+
+def has_usable_volume(volumes, min_nonzero_ratio=0.5):
+    """Guards against instruments (forex, spot gold) that report no real volume -
+    without this, a run of zeros would falsely look like a 'spike' of 0 >= 0."""
+    if volumes is None or len(volumes) == 0:
+        return False
+    nonzero = np.count_nonzero(volumes)
+    return (nonzero / len(volumes)) >= min_nonzero_ratio
+
+
+def volume_spike(volumes, window=VOLUME_SPIKE_WINDOW, multiplier=VOLUME_SPIKE_MULTIPLIER):
+    """True if the latest candle's volume meaningfully exceeds its recent average -
+    i.e. the rejection/breakout candle was backed by real participation, not thin noise."""
+    if not has_usable_volume(volumes) or len(volumes) < window + 1:
+        return False
+    avg_vol = np.mean(volumes[-window - 1:-1])
+    if avg_vol <= 0:
+        return False
+    return volumes[-1] >= avg_vol * multiplier
 
 
 # ---------- Multi-timeframe confluence ----------
@@ -449,10 +498,10 @@ def maybe_send_daily_summary(state, trade_log):
 # ---------- Core analysis ----------
 def analyze_pair(symbol: str, timeframe: str, data: dict, state: dict, trade_log: list,
                   blackout_active: bool, htf_bias: dict = None):
-    times, opens, closes, highs, lows = (
-        data["datetime"], data["open"], data["close"], data["high"], data["low"]
+    times, opens, closes, highs, lows, volumes = (
+        data["datetime"], data["open"], data["close"], data["high"], data["low"], data.get("volume")
     )
-    if len(closes) < max(30, EMA_TREND_PERIOD + 5):
+    if len(closes) < max(30, EMA_SLOW_PERIOD + 10):
         print(f"[Skip] {symbol} {timeframe}: not enough candles ({len(closes)})")
         return
 
@@ -500,6 +549,9 @@ def analyze_pair(symbol: str, timeframe: str, data: dict, state: dict, trade_log
                 if price_in_zone(price_now, bull_fvgs):
                     score += 1
                     tags.append("Bullish FVG")
+                if volume_spike(volumes):
+                    score += 1
+                    tags.append("Volume spike")
                 if score >= MIN_OPTIONAL_CONFLUENCE:
                     key = f"{symbol}_{timeframe}_LONG"
                     if already_alerted_recently(state, key, timeframe):
@@ -541,6 +593,9 @@ def analyze_pair(symbol: str, timeframe: str, data: dict, state: dict, trade_log
                 if price_in_zone(price_now, bear_fvgs):
                     score += 1
                     tags.append("Bearish FVG")
+                if volume_spike(volumes):
+                    score += 1
+                    tags.append("Volume spike")
                 if score >= MIN_OPTIONAL_CONFLUENCE:
                     key = f"{symbol}_{timeframe}_SHORT"
                     if already_alerted_recently(state, key, timeframe):
@@ -562,10 +617,11 @@ def analyze_pair(symbol: str, timeframe: str, data: dict, state: dict, trade_log
         near_support = f"{supports_below[0]:.5f}" if supports_below else "none"
         near_resistance = f"{resistances_above[0]:.5f}" if resistances_above else "none"
         htf_note = f" htf_trend={htf_bias['trend']}" if htf_bias is not None else ""
+        vol_note = " volume_data=yes" if has_usable_volume(volumes) else " volume_data=no"
         print(
             f"[No signal] {symbol} {timeframe}: price={price_now:.5f} "
             f"RSI={current_rsi:.0f} trend={trend}{htf_note} nearest_support={near_support} "
-            f"nearest_resistance={near_resistance}"
+            f"nearest_resistance={near_resistance}{vol_note}"
         )
 
 
