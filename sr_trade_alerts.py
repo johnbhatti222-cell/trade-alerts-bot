@@ -181,6 +181,7 @@ def analyze_pair(symbol: str, timeframe: str):
         return
     closes, highs, lows = data["close"], data["high"], data["low"]
     if len(closes) < 30:
+        print(f"[Skip] {symbol} {timeframe}: not enough candles ({len(closes)})")
         return
 
     price_now = closes[-1]
@@ -194,6 +195,8 @@ def analyze_pair(symbol: str, timeframe: str):
     support_zones = merge_zones(swing_lows)
     supports_below = sorted([z for z in support_zones if z < price_now], reverse=True)
     resistances_above = sorted([z for z in resistance_zones if z > price_now])
+
+    signal_fired = False
 
     # --- LONG setup ---
     if supports_below:
@@ -217,6 +220,7 @@ def analyze_pair(symbol: str, timeframe: str):
                 tp = resistances_above[0] if resistances_above else entry + risk * DEFAULT_RR
                 rr = round((tp - entry) / risk, 2) if risk > 0 else 0
                 alert_signal(symbol, timeframe, "LONG", entry, sl, tp, rr, tags)
+                signal_fired = True
 
     # --- SHORT setup ---
     if resistances_above:
@@ -240,6 +244,16 @@ def analyze_pair(symbol: str, timeframe: str):
                 tp = supports_below[0] if supports_below else entry - risk * DEFAULT_RR
                 rr = round((entry - tp) / risk, 2) if risk > 0 else 0
                 alert_signal(symbol, timeframe, "SHORT", entry, sl, tp, rr, tags)
+                signal_fired = True
+
+    if not signal_fired:
+        near_support = f"{supports_below[0]:.5f}" if supports_below else "none"
+        near_resistance = f"{resistances_above[0]:.5f}" if resistances_above else "none"
+        print(
+            f"[No signal] {symbol} {timeframe}: price={price_now:.5f} "
+            f"RSI={current_rsi:.0f} nearest_support={near_support} "
+            f"nearest_resistance={near_resistance}"
+        )
 
 
 def alert_signal(symbol, timeframe, direction, entry, sl, tp, rr, tags):
