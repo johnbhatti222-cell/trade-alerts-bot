@@ -35,7 +35,7 @@ LOOKBACK_CANDLES = 150
 PIVOT_WINDOW = 5          # candles each side to confirm a swing high/low
 ZONE_MERGE_PCT = 0.15     # % distance to merge nearby levels into one zone
 ATR_PERIOD = 14
-SL_ATR_BUFFER = 1.2
+SL_ATR_BUFFER = 2.2
 DEFAULT_RR = 2.0
 REACTION_LOOKBACK = 3     # candles checked for a "reaction" at a zone
 
@@ -215,7 +215,9 @@ def analyze_pair(symbol: str, timeframe: str):
                 tags.append("Bullish FVG")
             if score >= MIN_CONFLUENCE:
                 entry = price_now
-                sl = zone - (current_atr * SL_ATR_BUFFER)
+                structural_low = min(lows[-REACTION_LOOKBACK:])
+                anchor = min(zone, structural_low)
+                sl = anchor - (current_atr * SL_ATR_BUFFER)
                 risk = entry - sl
                 tp = resistances_above[0] if resistances_above else entry + risk * DEFAULT_RR
                 rr = round((tp - entry) / risk, 2) if risk > 0 else 0
@@ -239,7 +241,9 @@ def analyze_pair(symbol: str, timeframe: str):
                 tags.append("Bearish FVG")
             if score >= MIN_CONFLUENCE:
                 entry = price_now
-                sl = zone + (current_atr * SL_ATR_BUFFER)
+                structural_high = max(highs[-REACTION_LOOKBACK:])
+                anchor = max(zone, structural_high)
+                sl = anchor + (current_atr * SL_ATR_BUFFER)
                 risk = sl - entry
                 tp = supports_below[0] if supports_below else entry - risk * DEFAULT_RR
                 rr = round((entry - tp) / risk, 2) if risk > 0 else 0
