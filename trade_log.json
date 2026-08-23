@@ -9,5 +9,16 @@
     "entry_time": "2026-08-22 12:45:00",
     "status": "WIN",
     "closed_time": "2026-08-22 13:00:00"
+  },
+  {
+    "symbol": "XAU/USD",
+    "timeframe": "5min",
+    "direction": "SHORT",
+    "entry": 4603.15849,
+    "sl": 4609.887044142856,
+    "tp": 4589.701381714287,
+    "entry_time": "2026-08-24 05:35:00",
+    "status": "open",
+    "closed_time": null
   }
 ]
