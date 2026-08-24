@@ -42,5 +42,16 @@
     "entry_time": "2026-08-24 19:15:00",
     "status": "open",
     "closed_time": null
+  },
+  {
+    "symbol": "USD/JPY",
+    "timeframe": "15min",
+    "direction": "LONG",
+    "entry": 159.15715,
+    "sl": 158.44737857142857,
+    "tp": 160.57669285714286,
+    "entry_time": "2026-08-24 23:30:00",
+    "status": "open",
+    "closed_time": null
   }
 ]
