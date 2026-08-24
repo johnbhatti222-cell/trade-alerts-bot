@@ -62,9 +62,13 @@ LOOKBACK_CANDLES = 400    # generous history so the 200 EMA has room to stabiliz
 PIVOT_WINDOW = 5          # candles each side to confirm a swing high/low
 ZONE_MERGE_PCT = 0.15     # % distance to merge nearby levels into one zone
 ATR_PERIOD = 14
-SL_ATR_BUFFER = 2.2
+SL_ATR_BUFFER = 2.2       # fallback default; per-timeframe values below take priority
+SL_ATR_BUFFER_BY_TF = {"5min": 3.0, "15min": 2.5, "1h": 2.0}   # faster timeframes need proportionally more room
+SHORT_SL_EXTRA_MULTIPLIER = 1.2   # uptrends tend to wick through resistance (stop-hunting shorts)
+# more than downtrends undershoot support - give SHORT extra room on top of the timeframe buffer
 DEFAULT_RR = 2.0
-REACTION_LOOKBACK = 3     # candles checked for a "reaction" at a zone
+REACTION_LOOKBACK = 3          # candles checked for a "reaction" at a zone (fast, for detection)
+STRUCTURAL_ANCHOR_LOOKBACK = 6 # wider window used specifically for anchoring the stop-loss
 
 # --- Trade quality floor ---
 MIN_RR_RATIO = 2.0        # reject any setup whose real R:R (based on actual zone distance) falls below this
@@ -93,7 +97,8 @@ FVG_LOOKBACK = 20         # candles searched for unfilled fair value gaps
 VOLUME_SPIKE_WINDOW = 20
 VOLUME_SPIKE_MULTIPLIER = 1.5
 
-MIN_OPTIONAL_CONFLUENCE = 2   # of {RSI, liquidity grab, FVG, HTF zone alignment}, how many required
+MIN_OPTIONAL_CONFLUENCE_BY_DIRECTION = {"LONG": 2, "SHORT": 3}   # SHORT backtests weaker across
+# every pair - hold it to a higher confluence bar rather than disabling it outright
 
 # --- Sniper filters ---
 EMA_FAST_PERIOD = 50
@@ -264,6 +269,22 @@ def merge_zones(levels, pct=ZONE_MERGE_PCT):
         else:
             zones.append([lv])
     return [np.mean(z) for z in zones]
+
+
+def zone_cluster_extreme(all_swing_points, zone_center, direction, pct=ZONE_MERGE_PCT):
+    """merge_zones() averages clustered swing points into one 'zone' value - which can
+    sit above the cluster's actual lowest low (for support) or below its actual highest
+    high (for resistance), quietly shrinking the real stop-loss buffer. This finds the
+    true worst point within that cluster instead of trusting the average."""
+    members = [p for p in all_swing_points if abs(p - zone_center) / zone_center * 100 <= pct]
+    if not members:
+        return None
+    return min(members) if direction == "support" else max(members)
+
+
+def sl_buffer_for_timeframe(timeframe, direction="LONG"):
+    base = SL_ATR_BUFFER_BY_TF.get(timeframe, SL_ATR_BUFFER)
+    return base * SHORT_SL_EXTRA_MULTIPLIER if direction == "SHORT" else base
 
 
 def check_reaction(price_now, closes, zone, direction, tolerance_pct=0.25):
@@ -610,10 +631,14 @@ def check_open_trades(symbol, timeframe, data, trade_log):
             )
 
 
-def compute_stats(trade_log):
-    wins = sum(1 for t in trade_log if t["status"] == "WIN")
-    losses = sum(1 for t in trade_log if t["status"] == "LOSS")
-    open_trades = sum(1 for t in trade_log if t["status"] == "open")
+def compute_stats(trade_log, direction=None):
+    """direction=None gives overall stats; direction='LONG'/'SHORT' filters to that side.
+    Kept separate on purpose - pooling LONG and SHORT into one number was hiding the
+    exact asymmetry backtesting found between them."""
+    rows = trade_log if direction is None else [t for t in trade_log if t["direction"] == direction]
+    wins = sum(1 for t in rows if t["status"] == "WIN")
+    losses = sum(1 for t in rows if t["status"] == "LOSS")
+    open_trades = sum(1 for t in rows if t["status"] == "open")
     resolved = wins + losses
     win_rate = (wins / resolved * 100) if resolved else 0
     return wins, losses, open_trades, win_rate
@@ -623,17 +648,27 @@ def maybe_send_daily_summary(state, trade_log):
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if state.get("last_summary_date") == today_str:
         return
-    wins, losses, open_trades, win_rate = compute_stats(trade_log)
-    resolved = wins + losses
-    if resolved == 0 and open_trades == 0:
+
+    long_wins, long_losses, long_open, long_wr = compute_stats(trade_log, "LONG")
+    short_wins, short_losses, short_open, short_wr = compute_stats(trade_log, "SHORT")
+    total_resolved = long_wins + long_losses + short_wins + short_losses
+    total_open = long_open + short_open
+
+    if total_resolved == 0 and total_open == 0:
         state["last_summary_date"] = today_str
         return
+
+    def _line(label, wins, losses, wr, open_trades):
+        resolved = wins + losses
+        if resolved == 0 and open_trades == 0:
+            return f"{label}: no trades yet"
+        return f"{label}: {wins}W-{losses}L ({wr:.1f}%), {open_trades} open"
+
     msg = (
-        f"📊 *Daily Summary*\n"
-        f"Resolved trades: {resolved}\n"
-        f"Wins: {wins}   Losses: {losses}\n"
-        f"Win rate: {win_rate:.1f}%\n"
-        f"Open trades: {open_trades}"
+        f"📊 *Daily Summary*\n\n"
+        f"{_line('LONG', long_wins, long_losses, long_wr, long_open)}\n"
+        f"{_line('SHORT', short_wins, short_losses, short_wr, short_open)}\n\n"
+        f"Total resolved: {total_resolved}   Total open: {total_open}"
     )
     send_telegram(msg)
     state["last_summary_date"] = today_str
@@ -699,11 +734,12 @@ def analyze_pair(symbol: str, timeframe: str, data: dict, state: dict, trade_log
                 if liquidity_bias and liquidity_bias.get("bias") == "upside_hunt_risk":
                     score += 1
                     tags.append(f"Liquidity chase: crowded shorts (funding {liquidity_bias['funding_rate']*100:.3f}%)")
-                if score >= MIN_OPTIONAL_CONFLUENCE:
+                if score >= MIN_OPTIONAL_CONFLUENCE_BY_DIRECTION["LONG"]:
                     entry = price_now
-                    structural_low = min(lows[-REACTION_LOOKBACK:])
-                    anchor = min(zone, structural_low)
-                    sl = anchor - (current_atr * SL_ATR_BUFFER)
+                    structural_low = min(lows[-STRUCTURAL_ANCHOR_LOOKBACK:])
+                    cluster_low = zone_cluster_extreme(swing_lows, zone, "support")
+                    anchor = min(zone, structural_low, cluster_low) if cluster_low is not None else min(zone, structural_low)
+                    sl = anchor - (current_atr * sl_buffer_for_timeframe(timeframe, "LONG"))
                     risk = entry - sl
                     tp = resistances_above[0] if resistances_above else entry + risk * DEFAULT_RR
                     rr = round((tp - entry) / risk, 2) if risk > 0 else 0
@@ -759,11 +795,12 @@ def analyze_pair(symbol: str, timeframe: str, data: dict, state: dict, trade_log
                 if liquidity_bias and liquidity_bias.get("bias") == "downside_hunt_risk":
                     score += 1
                     tags.append(f"Liquidity chase: crowded longs (funding {liquidity_bias['funding_rate']*100:.3f}%)")
-                if score >= MIN_OPTIONAL_CONFLUENCE:
+                if score >= MIN_OPTIONAL_CONFLUENCE_BY_DIRECTION["SHORT"]:
                     entry = price_now
-                    structural_high = max(highs[-REACTION_LOOKBACK:])
-                    anchor = max(zone, structural_high)
-                    sl = anchor + (current_atr * SL_ATR_BUFFER)
+                    structural_high = max(highs[-STRUCTURAL_ANCHOR_LOOKBACK:])
+                    cluster_high = zone_cluster_extreme(swing_highs, zone, "resistance")
+                    anchor = max(zone, structural_high, cluster_high) if cluster_high is not None else max(zone, structural_high)
+                    sl = anchor + (current_atr * sl_buffer_for_timeframe(timeframe, "SHORT"))
                     risk = sl - entry
                     tp = supports_below[0] if supports_below else entry - risk * DEFAULT_RR
                     rr = round((entry - tp) / risk, 2) if risk > 0 else 0
@@ -871,8 +908,10 @@ def run_once():
     save_json(STATE_FILE, state)
     save_json(TRADE_LOG_FILE, trade_log)
 
-    wins, losses, open_trades, win_rate = compute_stats(trade_log)
-    print(f"[Stats] Resolved={wins + losses} Wins={wins} Losses={losses} WinRate={win_rate:.1f}% Open={open_trades}")
+    long_wins, long_losses, long_open, long_wr = compute_stats(trade_log, "LONG")
+    short_wins, short_losses, short_open, short_wr = compute_stats(trade_log, "SHORT")
+    print(f"[Stats] LONG: {long_wins}W-{long_losses}L ({long_wr:.1f}%) Open={long_open}   "
+          f"SHORT: {short_wins}W-{short_losses}L ({short_wr:.1f}%) Open={short_open}")
 
 
 if __name__ == "__main__":
