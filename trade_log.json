@@ -73,8 +73,8 @@
     "sl": 158.54156964285713,
     "tp": 160.18647071428572,
     "entry_time": "2026-08-25 08:00:00",
-    "status": "open",
-    "closed_time": null
+    "status": "WIN",
+    "closed_time": "2026-08-29 02:30:00"
   },
   {
     "symbol": "USD/JPY",
@@ -117,8 +117,8 @@
     "sl": 158.7418482142857,
     "tp": 159.99120357142857,
     "entry_time": "2026-08-26 11:30:00",
-    "status": "open",
-    "closed_time": null
+    "status": "WIN",
+    "closed_time": "2026-08-29 01:30:00"
   },
   {
     "symbol": "USD/JPY",
@@ -128,8 +128,8 @@
     "sl": 158.7028267857143,
     "tp": 159.9215864285714,
     "entry_time": "2026-08-26 21:00:00",
-    "status": "open",
-    "closed_time": null
+    "status": "WIN",
+    "closed_time": "2026-08-29 00:15:00"
   },
   {
     "symbol": "USD/JPY",
