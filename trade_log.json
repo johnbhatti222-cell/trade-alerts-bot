@@ -172,7 +172,7 @@
     "sl": 78391.32285714286,
     "tp": 80242.25428571428,
     "entry_time": "2026-09-01 05:30:00",
-    "status": "open",
-    "closed_time": null
+    "status": "LOSS",
+    "closed_time": "2026-09-01 08:05:00"
   }
 ]
