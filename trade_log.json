@@ -40,8 +40,8 @@
     "sl": 158.6702683939394,
     "tp": 160.3297532121212,
     "entry_time": "2026-08-24 19:15:00",
-    "status": "open",
-    "closed_time": null
+    "status": "WIN",
+    "closed_time": "2026-09-02 11:30:00"
   },
   {
     "symbol": "USD/JPY",
@@ -161,8 +161,8 @@
     "sl": 158.79969857142856,
     "tp": 160.3879028571429,
     "entry_time": "2026-08-28 09:45:00",
-    "status": "open",
-    "closed_time": null
+    "status": "WIN",
+    "closed_time": "2026-09-02 11:45:00"
   },
   {
     "symbol": "BTC/USD",
