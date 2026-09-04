@@ -194,7 +194,7 @@
     "sl": 4463.182019285714,
     "tp": 4496.45288,
     "entry_time": "2026-09-04 09:15:00",
-    "status": "open",
-    "closed_time": null
+    "status": "LOSS",
+    "closed_time": "2026-09-04 16:30:00"
   }
 ]
