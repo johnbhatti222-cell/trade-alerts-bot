@@ -205,8 +205,8 @@
     "sl": 79328.09642857143,
     "tp": 80966.75,
     "entry_time": "2026-09-05 12:45:00",
-    "status": "open",
-    "closed_time": null
+    "status": "LOSS",
+    "closed_time": "2026-09-06 14:30:00"
   },
   {
     "symbol": "BTC/USD",
@@ -216,8 +216,8 @@
     "sl": 79345.47857142857,
     "tp": 80966.75,
     "entry_time": "2026-09-05 15:45:00",
-    "status": "open",
-    "closed_time": null
+    "status": "LOSS",
+    "closed_time": "2026-09-06 14:30:00"
   },
   {
     "symbol": "BTC/USD",
@@ -227,7 +227,7 @@
     "sl": 79367.445,
     "tp": 80815.10999999999,
     "entry_time": "2026-09-06 08:05:00",
-    "status": "open",
-    "closed_time": null
+    "status": "LOSS",
+    "closed_time": "2026-09-06 14:30:00"
   }
 ]
