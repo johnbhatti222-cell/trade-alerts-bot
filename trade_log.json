@@ -262,5 +262,16 @@
     "entry_time": "2026-09-16 15:00:00",
     "status": "WIN",
     "closed_time": "2026-09-17 06:15:00"
+  },
+  {
+    "symbol": "BTC/USD",
+    "timeframe": "5min",
+    "direction": "LONG",
+    "entry": 76328.01,
+    "sl": 75902.94857142858,
+    "tp": 77205.39,
+    "entry_time": "2026-09-17 00:10:00",
+    "status": "open",
+    "closed_time": null
   }
 ]
