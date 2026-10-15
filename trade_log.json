@@ -348,8 +348,8 @@
     "sl": 157.58184,
     "tp": 159.60341999999997,
     "entry_time": "2026-10-09 23:00:00",
-    "status": "open",
-    "closed_time": null
+    "status": "LOSS",
+    "closed_time": "2026-10-16 00:45:00"
   },
   {
     "symbol": "USD/JPY",
