@@ -383,5 +383,27 @@
     "entry_time": "2026-10-12 06:00:00",
     "status": "LOSS",
     "closed_time": "2026-10-15 12:00:00"
+  },
+  {
+    "symbol": "BTC/USD",
+    "timeframe": "5min",
+    "direction": "LONG",
+    "entry": 82128.0,
+    "sl": 81347.70142857144,
+    "tp": 83688.59714285712,
+    "entry_time": "2026-10-18 23:40:00",
+    "status": "open",
+    "closed_time": null
+  },
+  {
+    "symbol": "XAU/USD",
+    "timeframe": "5min",
+    "direction": "LONG",
+    "entry": 4183.22622,
+    "sl": 4164.226212142857,
+    "tp": 4221.226235714285,
+    "entry_time": "2026-10-19 10:40:00",
+    "status": "open",
+    "closed_time": null
   }
 ]
