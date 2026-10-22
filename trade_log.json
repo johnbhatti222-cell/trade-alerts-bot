@@ -315,8 +315,8 @@
     "sl": 157.34462642857142,
     "tp": 159.46119714285717,
     "entry_time": "2026-10-06 14:00:00",
-    "status": "open",
-    "closed_time": null
+    "status": "LOSS",
+    "closed_time": "2026-10-22 16:45:00"
   },
   {
     "symbol": "USD/JPY",
@@ -326,8 +326,8 @@
     "sl": 157.3978425,
     "tp": 159.676575,
     "entry_time": "2026-10-07 03:45:00",
-    "status": "open",
-    "closed_time": null
+    "status": "LOSS",
+    "closed_time": "2026-10-22 16:45:00"
   },
   {
     "symbol": "USD/JPY",
@@ -337,8 +337,8 @@
     "sl": 157.45587250000003,
     "tp": 159.63701499999993,
     "entry_time": "2026-10-08 01:30:00",
-    "status": "open",
-    "closed_time": null
+    "status": "LOSS",
+    "closed_time": "2026-10-22 16:45:00"
   },
   {
     "symbol": "USD/JPY",
@@ -425,7 +425,7 @@
     "sl": 157.6867707142857,
     "tp": 159.1405985714286,
     "entry_time": "2026-10-21 05:30:00",
-    "status": "open",
-    "closed_time": null
+    "status": "LOSS",
+    "closed_time": "2026-10-22 14:00:00"
   }
 ]
