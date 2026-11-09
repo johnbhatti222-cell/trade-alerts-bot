@@ -469,7 +469,7 @@
     "sl": 157.79113464285714,
     "tp": 159.83238071428573,
     "entry_time": "2026-11-08 09:00:00",
-    "status": "open",
-    "closed_time": null
+    "status": "LOSS",
+    "closed_time": "2026-11-10 06:30:00"
   }
 ]
